@@ -1,13 +1,16 @@
 # Maintainer: pod32g
 pkgname=umao-dev-setup
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="UmaOS development environment setup wizard"
 arch=('any')
 url="https://github.com/pod32g/umao-dev-setup"
 license=('MIT')
-depends=('python' 'python-pyqt6' 'qt6-declarative')
-optdepends=('kdialog: fallback GUI when PyQt6 is unavailable')
+# polkit provides pkexec, which both GUI install paths use to escalate.
+depends=('python' 'python-pyqt6' 'qt6-declarative' 'polkit')
+optdepends=('kdialog: fallback GUI when PyQt6 is unavailable'
+            'qt6-tools: progress dialog updates (qdbus6) in the kdialog fallback'
+            'yay: install AUR packages for the AI/editor stacks')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/pod32g/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -15,7 +18,7 @@ package() {
     cd "$pkgname-$pkgver"
 
     # Main executable
-    install -Dm755 umao-dev-setup "$pkgdir/usr/local/bin/umao-dev-setup"
+    install -Dm755 umao-dev-setup "$pkgdir/usr/bin/umao-dev-setup"
 
     # QML files
     install -dm755 "$pkgdir/usr/share/umaos/dev-setup"
@@ -26,5 +29,12 @@ package() {
     install -Dm644 icon.png "$pkgdir/usr/share/umaos/dev-setup/icon.png"
 
     # Desktop entry
-    install -Dm644 dev-setup.desktop "$pkgdir/etc/skel/Desktop/Dev Setup.desktop"
+    # /usr/share/applications gives the app a menu entry and is the only copy
+    # pre-existing users ever see; skel only reaches users created later.
+    # Plasma treats a non-executable desktop launcher as untrusted -> 0755.
+    install -Dm644 dev-setup.desktop "$pkgdir/usr/share/applications/umao-dev-setup.desktop"
+    install -Dm755 dev-setup.desktop "$pkgdir/etc/skel/Desktop/Dev Setup.desktop"
+
+    # MIT is declared in license=(); Arch requires shipping the text.
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
