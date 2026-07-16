@@ -3,6 +3,7 @@
 
 import os
 import sys
+import shlex
 import subprocess
 import shutil
 from dataclasses import dataclass, field
@@ -67,50 +68,117 @@ STACKS = [
 
 STACKS_BY_TAG = {s.tag: s for s in STACKS}
 
+# ── Privilege helpers ──────────────────────────────────────────────────────────
+#
+# sudo can only prompt on a TTY: launched from the app menu / desktop there is
+# none, so bare `sudo ...` fails instantly ("a terminal is required") while the
+# GUI carries on as if it worked. pkexec authenticates through the polkit GUI
+# agent instead. Note pkexec and sudo do NOT share auth caches — that is why
+# entering a password for the pacman step never "carries over" to sudo calls.
+
+def root_runner() -> list[str]:
+    if os.geteuid() == 0:
+        return []
+    if sys.stdin.isatty():
+        return ["sudo"]
+    return ["pkexec"]
+
+
+ASKPASS_CANDIDATES = [
+    "/usr/bin/ksshaskpass",
+    "/usr/lib/ssh/x11-ssh-askpass",
+    "/usr/bin/ssh-askpass",
+]
+
+
+def yay_invocation():
+    """(env, extra_flags) so yay's internal sudo can prompt, or (None, [])
+    when AUR installs cannot work in this session (no TTY, no askpass)."""
+    if sys.stdin.isatty():
+        return dict(os.environ), []
+    for helper in ASKPASS_CANDIDATES:
+        if os.path.isfile(helper):
+            env = dict(os.environ)
+            env["SUDO_ASKPASS"] = helper
+            return env, ["--sudoflags", "-A"]
+    return None, []
+
+
 # ── Post-install hooks ─────────────────────────────────────────────────────────
 
-def run_post_hooks(tags: list[str]) -> None:
+def run_post_hooks(tags: list[str]) -> list[str]:
+    """Run post-install hooks. Returns a list of failed step descriptions.
+
+    Root-level steps (systemctl/usermod/initdb/npm -g) are batched into ONE
+    escalated bash call so the user authenticates at most once more, and
+    every failure is reported instead of being silently swallowed.
+    """
+    failures: list[str] = []
+    root_steps: list[tuple[str, str]] = []  # (description, shell snippet)
+
+    NPM_GLOBALS = {
+        "claude-code": "@anthropic-ai/claude-code",
+        "codex": "@openai/codex",
+        "gemini-cli": "@google/gemini-cli",
+    }
+
     for tag in tags:
         stack = STACKS_BY_TAG.get(tag)
         if not stack:
             continue
-        if stack.tag == "rust" and shutil.which("rustup"):
-            subprocess.run(["rustup", "default", "stable"],
-                           capture_output=True)
-        elif stack.tag == "claude-code" and shutil.which("npm"):
-            subprocess.run(["npm", "install", "-g", "@anthropic-ai/claude-code"],
-                           capture_output=True)
-        elif stack.tag == "codex" and shutil.which("npm"):
-            subprocess.run(["npm", "install", "-g", "@openai/codex"],
-                           capture_output=True)
-        elif stack.tag == "gemini-cli" and shutil.which("npm"):
-            subprocess.run(["npm", "install", "-g", "@google/gemini-cli"],
-                           capture_output=True)
-        elif stack.tag == "aider" and shutil.which("pipx"):
-            subprocess.run(["pipx", "install", "aider-chat"],
-                           capture_output=True)
-        elif stack.tag == "ollama" and shutil.which("ollama"):
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "ollama.service"],
-                           capture_output=True)
-        elif stack.tag == "docker" and shutil.which("docker"):
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "docker.service"],
-                           capture_output=True)
+        if tag == "rust" and shutil.which("rustup"):
+            r = subprocess.run(["rustup", "default", "stable"], capture_output=True)
+            if r.returncode != 0:
+                failures.append("rustup default stable")
+        elif tag in NPM_GLOBALS and shutil.which("npm"):
+            # npm -g writes to /usr/lib/node_modules on Arch — needs root.
+            spec = NPM_GLOBALS[tag]
+            root_steps.append((f"npm install -g {spec}",
+                               f"npm install -g {shlex.quote(spec)}"))
+        elif tag == "aider" and shutil.which("pipx"):
+            r = subprocess.run(["pipx", "install", "aider-chat"], capture_output=True)
+            if r.returncode != 0:
+                failures.append("pipx install aider-chat")
+        elif tag == "ollama" and shutil.which("ollama"):
+            root_steps.append(("enable ollama.service",
+                               "systemctl enable --now ollama.service"))
+        elif tag == "docker" and shutil.which("docker"):
+            root_steps.append(("enable docker.service",
+                               "systemctl enable --now docker.service"))
             user = os.environ.get("SUDO_USER") or os.environ.get("USER", "")
             if user:
                 groups_out = subprocess.run(["groups", user], capture_output=True, text=True)
                 if "docker" not in groups_out.stdout:
-                    subprocess.run(["sudo", "usermod", "-aG", "docker", user],
-                                   capture_output=True)
-        elif stack.tag == "postgresql" and shutil.which("postgres"):
-            pg_data = "/var/lib/postgres/data"
-            if not os.path.isdir(os.path.join(pg_data, "base")):
-                subprocess.run(["sudo", "-u", "postgres", "initdb", "-D", pg_data],
-                               capture_output=True)
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "postgresql.service"],
-                           capture_output=True)
-        elif stack.tag == "redis" and shutil.which("redis-server"):
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "redis.service"],
-                           capture_output=True)
+                    root_steps.append((f"add {user} to docker group",
+                                       f"usermod -aG docker {shlex.quote(user)}"))
+        elif tag == "postgresql" and shutil.which("postgres"):
+            root_steps.append(("initialize PostgreSQL data dir",
+                               "[ -d /var/lib/postgres/data/base ] || "
+                               "{ install -d -o postgres -g postgres /var/lib/postgres/data && "
+                               "sudo -u postgres initdb -D /var/lib/postgres/data; }"))
+            root_steps.append(("enable postgresql.service",
+                               "systemctl enable --now postgresql.service"))
+        elif tag == "redis" and shutil.which("redis-server"):
+            root_steps.append(("enable redis.service",
+                               "systemctl enable --now redis.service"))
+
+    if root_steps:
+        marker = "UMAO_HOOK_FAILED::"
+        script = "\n".join(
+            f"( {snippet} ) >/dev/null 2>&1 || echo {shlex.quote(marker + desc)}"
+            for desc, snippet in root_steps
+        )
+        r = subprocess.run(root_runner() + ["bash", "-c", script],
+                           capture_output=True, text=True)
+        if r.returncode != 0 and marker not in (r.stdout or ""):
+            # Escalation itself failed (auth cancelled / no method available)
+            failures.extend(desc for desc, _ in root_steps)
+        else:
+            for line in (r.stdout or "").splitlines():
+                if line.startswith(marker):
+                    failures.append(line[len(marker):])
+
+    return failures
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -215,36 +283,54 @@ def run_qml() -> None:
                             self.progressChanged.emit(done, total)
 
                 # Install AUR packages
-                aur_warning = ""
+                warnings = []
+                failed_aur = []
                 if aur:
-                    if shutil.which("yay"):
+                    env, extra_flags = yay_invocation()
+                    if shutil.which("yay") and env is not None:
                         for pkg in aur:
                             self.currentPackageChanged.emit(pkg)
-                            subprocess.run(
-                                ["yay", "-S", "--needed", "--noconfirm", pkg],
-                                capture_output=True,
+                            r = subprocess.run(
+                                ["yay", "-S", "--needed", "--noconfirm", *extra_flags, pkg],
+                                capture_output=True, env=env,
                             )
+                            if r.returncode != 0:
+                                failed_aur.append(pkg)
                             done += 1
                             self.packageCompleted.emit(pkg)
                             self.progressChanged.emit(done, total)
+                        if failed_aur:
+                            warnings.append(
+                                "AUR packages failed to install: "
+                                + ", ".join(failed_aur)
+                            )
                     else:
-                        aur_warning = (
-                            "yay is not installed. These AUR packages "
-                            "need manual install: " + ", ".join(aur)
+                        reason = ("yay is not installed"
+                                  if not shutil.which("yay")
+                                  else "no way to prompt for the AUR helper's password")
+                        warnings.append(
+                            f"{reason}. These AUR packages need manual "
+                            "install: " + ", ".join(aur)
                         )
                         for pkg in aur:
                             done += 1
                             self.progressChanged.emit(done, total)
 
-                run_post_hooks(self.tags)
+                hook_failures = run_post_hooks(self.tags)
+                if hook_failures:
+                    warnings.append(
+                        "Post-install steps failed: " + "; ".join(hook_failures)
+                    )
+                aur_warning = "\n".join(warnings)
 
                 stack_names = []
                 for tag in self.tags:
                     s = STACKS_BY_TAG.get(tag)
                     if s:
                         stack_names.append(s.display_name)
+                installed_count = len(all_pkgs) - len(failed_aur)
                 summary = (
-                    f"Installed {len(all_pkgs)} packages across "
+                    f"Installed {installed_count} of {len(all_pkgs)} packages across "
                     f"{len(self.tags)} stacks: {', '.join(stack_names)}."
                 )
                 self.installComplete.emit(summary, aur_warning)
@@ -367,31 +453,44 @@ def run_kdialog() -> None:
         subprocess.run(["qdbus6", dbus, "Set", "", "value", str(value)],
                        capture_output=True)
 
+    problems = []
+
     if official:
-        for pkg in official:
-            update_progress(f"Installing {pkg}...", done)
-            subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm", pkg],
+        # One escalated batch call = one authentication prompt.
+        update_progress(f"Installing {len(official)} packages...", done)
+        r = subprocess.run(root_runner() + ["pacman", "-S", "--needed", "--noconfirm"] + official,
                            capture_output=True)
-            done += 1
+        if r.returncode != 0:
+            problems.append("pacman install failed (cancelled authentication?): "
+                            + " ".join(official))
+        done += len(official)
+        update_progress("Official packages done.", done)
 
     if aur:
-        if shutil.which("yay"):
+        env, extra_flags = yay_invocation()
+        if shutil.which("yay") and env is not None:
             for pkg in aur:
                 update_progress(f"Installing {pkg} (AUR)...", done)
-                subprocess.run(["yay", "-S", "--needed", "--noconfirm", pkg],
-                               capture_output=True)
+                r = subprocess.run(["yay", "-S", "--needed", "--noconfirm", *extra_flags, pkg],
+                                   capture_output=True, env=env)
+                if r.returncode != 0:
+                    problems.append(f"AUR install failed: {pkg}")
                 done += 1
         else:
+            problems.append("AUR packages need manual install: " + " ".join(aur))
             done += len(aur)
 
     update_progress("Done!", total)
     subprocess.run(["qdbus6", dbus, "close"], capture_output=True)
 
-    run_post_hooks(tags)
+    hook_failures = run_post_hooks(tags)
+    if hook_failures:
+        problems.append("Post-install steps failed: " + "; ".join(hook_failures))
 
-    msg = "Umazing! Dev environment is ready."
-    if aur and not shutil.which("yay"):
-        msg += f"\n\nyay is not installed. These AUR packages need manual install:\n{' '.join(aur)}"
+    if problems:
+        msg = "Dev setup finished with problems:\n\n" + "\n".join(problems)
+    else:
+        msg = "Umazing! Dev environment is ready."
 
     subprocess.run(["kdialog", "--icon", ICON, "--title", TITLE,
                      "--passivepopup", msg, "5"], capture_output=True)
@@ -471,10 +570,15 @@ def run_text() -> None:
             for pkg in aur:
                 print(f"    {pkg}")
 
-    run_post_hooks(tags)
+    hook_failures = run_post_hooks(tags)
 
     print()
-    print("  Umazing! Dev environment is ready.")
+    if hook_failures:
+        print("  Completed with problems — these post-install steps failed:")
+        for f in hook_failures:
+            print(f"    - {f}")
+    else:
+        print("  Umazing! Dev environment is ready.")
     print()
 
 
