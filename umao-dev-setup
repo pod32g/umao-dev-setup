@@ -44,7 +44,8 @@ STACKS = [
     # Editors
     Stack("vscode", "VS Code", "code", "editors", ["code"]),
     Stack("neovim", "Neovim", "nvim", "editors", ["neovim"]),
-    Stack("helix", "Helix", "hx", "editors", ["helix"]),
+    # Arch's helix package installs /usr/bin/helix, not `hx`.
+    Stack("helix", "Helix", "helix", "editors", ["helix"]),
     Stack("emacs", "Emacs", "emacs", "editors", ["emacs"]),
     # AI
     Stack("ollama", "Ollama", "ollama", "ai", ["ollama"]),
@@ -61,7 +62,10 @@ STACKS = [
     Stack("ansible", "Ansible", "ansible", "devops", ["ansible"]),
     # Data
     Stack("postgresql", "PostgreSQL", "postgres", "data", ["postgresql"]),
-    Stack("redis", "Redis", "redis-server", "data", ["redis"]),
+    # Arch dropped `redis` from [extra] (April 2025); valkey is the drop-in
+    # replacement and still ships /usr/bin/redis-server and redis.service, so
+    # check_cmd and the redis.service hook below stay valid.
+    Stack("redis", "Valkey (Redis)", "redis-server", "data", ["valkey"]),
     Stack("sqlite", "SQLite", "sqlite3", "data", ["sqlite"]),
     Stack("mongodb", "MongoDB", "mongosh", "data", ["mongosh"]),
 ]
@@ -197,14 +201,20 @@ def dedupe_packages(tags: list[str]) -> list[str]:
     return list(seen.keys())
 
 def classify_packages(pkgs: list[str]) -> tuple[list[str], list[str]]:
-    """Split into (official, aur) packages."""
+    """Split into (official, aur) packages.
+
+    A `pacman -Si` timeout or a missing pacman used to raise straight out of
+    here, killing the kdialog/text flows with a traceback and aborting the GUI
+    install. Treat lookup failures as "not official" (the AUR path warns
+    rather than silently doing nothing).
+    """
     official, aur = [], []
     for pkg in pkgs:
-        ret = subprocess.run(["pacman", "-Si", pkg],
-                             capture_output=True, timeout=10)
-        if ret.returncode == 0:
-            official.append(pkg)
-        else:
+        try:
+            ret = subprocess.run(["pacman", "-Si", pkg],
+                                 capture_output=True, timeout=15)
+            (official if ret.returncode == 0 else aur).append(pkg)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             aur.append(pkg)
     return official, aur
 
@@ -243,13 +253,17 @@ def run_qml() -> None:
                 completed = set()
                 done = 0
 
-                # Install official packages via single pkexec call
+                # Install official packages via single escalated call.
                 if official:
                     self.currentPackageChanged.emit(official[0])
+                    # pacman's output is localized: without LC_ALL=C the
+                    # "installing <pkg>" lines we scrape below never match on a
+                    # non-English system and the bar sits at 0 until the end.
+                    env = dict(os.environ, LC_ALL="C", LANG="C")
                     proc = subprocess.Popen(
-                        ["pkexec", "pacman", "-S", "--needed", "--noconfirm"] + official,
+                        root_runner() + ["pacman", "-Syu", "--needed", "--noconfirm"] + official,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1,
+                        text=True, bufsize=1, env=env,
                     )
                     for line in proc.stdout:
                         line = line.strip()
@@ -265,16 +279,22 @@ def run_qml() -> None:
                                     if remaining:
                                         self.currentPackageChanged.emit(remaining[0])
                     proc.wait()
-                    if proc.returncode != 0 and not completed:
-                        # pkexec or pacman failed entirely
+                    if proc.returncode != 0:
+                        # Any nonzero exit means the transaction did not
+                        # complete. Previously this was guarded by
+                        # `and not completed`, so a failure *after* some
+                        # "installing" lines (e.g. disk full mid-transaction)
+                        # fell through and every package was marked done —
+                        # reporting a clean success for a broken install.
                         self.installError.emit(
                             "Installation failed (exit code "
                             + str(proc.returncode)
-                            + "). Authentication may have been cancelled."
+                            + "). Authentication may have been cancelled, or the "
+                            "transaction failed part-way through."
                         )
                         return
-                    # Mark any un-tracked official packages as done
-                    # (pacman installs all-or-nothing with --needed)
+                    # Success: pacman -S --needed is all-or-nothing, so anything
+                    # not seen in the output was already present.
                     for pkg in official:
                         if pkg not in completed:
                             completed.add(pkg)
@@ -439,19 +459,37 @@ def run_kdialog() -> None:
 
     official, aur = classify_packages(all_pkgs)
     total = len(all_pkgs)
-    dbus = subprocess.run(
+    # kdialog --progressbar prints "<service> <objectpath>" — two space-separated
+    # tokens. Passing the whole string as ONE qdbus argument made every
+    # subsequent call a silent no-op: the bar never advanced and never closed.
+    dbus_ref = subprocess.run(
         ["kdialog", "--icon", ICON, "--title", TITLE,
          "--progressbar", "Preparing installation...", str(total)],
         capture_output=True, text=True,
-    ).stdout.strip()
+    ).stdout.split()
 
     done = 0
 
     def update_progress(label, value):
-        subprocess.run(["qdbus6", dbus, "setLabelText", label],
-                       capture_output=True)
-        subprocess.run(["qdbus6", dbus, "Set", "", "value", str(value)],
-                       capture_output=True)
+        if len(dbus_ref) < 2:
+            return
+        try:
+            subprocess.run(["qdbus6", *dbus_ref, "setLabelText", label],
+                           capture_output=True)
+            subprocess.run(["qdbus6", *dbus_ref, "Set", "", "value", str(value)],
+                           capture_output=True)
+        except FileNotFoundError:
+            # qdbus6 (qt6-tools) missing: progress updates are cosmetic, so
+            # degrade instead of crashing the whole install flow.
+            pass
+
+    def close_progress():
+        if len(dbus_ref) < 2:
+            return
+        try:
+            subprocess.run(["qdbus6", *dbus_ref, "close"], capture_output=True)
+        except FileNotFoundError:
+            pass
 
     problems = []
 
@@ -481,7 +519,7 @@ def run_kdialog() -> None:
             done += len(aur)
 
     update_progress("Done!", total)
-    subprocess.run(["qdbus6", dbus, "close"], capture_output=True)
+    close_progress()
 
     hook_failures = run_post_hooks(tags)
     if hook_failures:
@@ -557,25 +595,37 @@ def run_text() -> None:
 
     official, aur = classify_packages(all_pkgs)
 
+    text_problems = []
+
     if official:
         print("  >> Installing from official repos...")
-        subprocess.run(["sudo", "pacman", "-S", "--needed", "--noconfirm"] + official)
+        # root_runner() instead of a hardcoded sudo: crashes on sudo-less
+        # systems and pointlessly re-prompts when already root. -Syu because a
+        # plain -S against a stale sync db 404s on a freshly imaged system.
+        r = subprocess.run(root_runner() + ["pacman", "-Syu", "--needed", "--noconfirm"] + official)
+        if r.returncode != 0:
+            text_problems.append(f"pacman failed (exit {r.returncode}): {' '.join(official)}")
 
     if aur:
         if shutil.which("yay"):
             print("  >> Installing from AUR...")
-            subprocess.run(["yay", "-S", "--needed", "--noconfirm"] + aur)
+            r = subprocess.run(["yay", "-S", "--needed", "--noconfirm"] + aur)
+            if r.returncode != 0:
+                text_problems.append(f"yay failed (exit {r.returncode}): {' '.join(aur)}")
         else:
             print("  WARNING: yay not found. These AUR packages need manual install:")
             for pkg in aur:
                 print(f"    {pkg}")
+            text_problems.append("AUR packages need manual install: " + " ".join(aur))
 
-    hook_failures = run_post_hooks(tags)
+    text_problems += run_post_hooks(tags)
 
     print()
-    if hook_failures:
-        print("  Completed with problems — these post-install steps failed:")
-        for f in hook_failures:
+    if text_problems:
+        # Previously this printed "Umazing! Dev environment is ready." even
+        # after a completely failed install: only hook failures were checked.
+        print("  Completed with problems:")
+        for f in text_problems:
             print(f"    - {f}")
     else:
         print("  Umazing! Dev environment is ready.")
