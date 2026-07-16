@@ -4,6 +4,7 @@ import QtQuick.Controls as QQC2
 Item {
     id: root
     property var selectedTags: []
+    property real progressRatio: 0
 
     // ── Header ──
     Column {
@@ -88,7 +89,8 @@ Item {
                 height: parent.height
                 radius: 3
                 color: Theme.primaryGreen
-                width: 0
+                // Bound (not assigned) so it survives window resizes.
+                width: progressTrack.width * root.progressRatio
 
                 Behavior on width {
                     NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
@@ -162,18 +164,48 @@ Item {
     }
 
     // ── Error display ──
-    Text {
-        id: errorLabel
+    // On failure the user was previously stranded here: the message appeared
+    // but there was no retry/back/close control anywhere on the screen, so the
+    // only way out was killing the window.
+    Column {
+        id: errorArea
         anchors.bottom: parent.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.margins: 36
+        spacing: 14
         visible: false
-        text: ""
-        font.family: Theme.sansFont
-        font.pixelSize: 13
-        color: "#ff7c8a"
-        wrapMode: Text.WordWrap
+
+        Text {
+            id: errorLabel
+            width: parent.width
+            text: ""
+            font.family: Theme.sansFont
+            font.pixelSize: 13
+            color: "#ff7c8a"
+            wrapMode: Text.WordWrap
+        }
+
+        Row {
+            spacing: 12
+
+            QQC2.Button {
+                text: "Back"
+                onClicked: stackView.pop()
+            }
+
+            QQC2.Button {
+                text: "Retry"
+                onClicked: {
+                    errorArea.visible = false
+                    completedModel.clear()
+                    root.progressRatio = 0
+                    counterLabel.text = ""
+                    currentPkgLabel.text = "Preparing..."
+                    backend.install(root.selectedTags)
+                }
+            }
+        }
     }
 
     // ── Backend connections ──
@@ -181,7 +213,10 @@ Item {
         target: backend
 
         function onProgressChanged(current, total) {
-            progressFill.width = progressTrack.width * (current / total)
+            // Store the ratio and let the width bind to it: assigning width
+            // imperatively broke the binding, so resizing the window mid-install
+            // left the bar at a stale width until the next signal.
+            root.progressRatio = total > 0 ? (current / total) : 0
             counterLabel.text = current + " / " + total
         }
 
@@ -199,7 +234,7 @@ Item {
 
         function onInstallError(error) {
             errorLabel.text = error
-            errorLabel.visible = true
+            errorArea.visible = true
             currentPkgLabel.text = "Installation failed"
         }
     }

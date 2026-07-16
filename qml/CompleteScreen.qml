@@ -5,11 +5,24 @@ Item {
     id: root
     property string summary: ""
     property string warning: ""
+    // True when the run reported problems, so the screen stops claiming an
+    // unqualified success while listing failures underneath.
+    readonly property bool hadProblems: warning !== ""
+
+    // Scrollable: the Column was centred with unbounded height, so a long
+    // warning list (failed AUR packages + post-install steps) pushed the Close
+    // button off the 720px window with no way to reach it.
+    QQC2.ScrollView {
+        anchors.fill: parent
+        contentWidth: availableWidth
+        clip: true
 
     Column {
-        anchors.centerIn: parent
+        anchors.horizontalCenter: parent.horizontalCenter
+        topPadding: 40
+        bottomPadding: 40
         spacing: 20
-        width: parent.width - 72
+        width: root.width - 72
 
         // Green checkmark circle
         Item {
@@ -48,9 +61,10 @@ Item {
             }
         }
 
-        // Title
+        // Title. Previously always "Umazing!" even when the warning text right
+        // below listed failed AUR packages and post-install steps.
         Text {
-            text: "Umazing!"
+            text: root.hadProblems ? "Finished with problems" : "Umazing!"
             font.family: Theme.sansFont
             font.pixelSize: 24
             font.weight: Font.Bold
@@ -108,6 +122,7 @@ Item {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: Qt.quit()
             }
+        }
         }
     }
 }
