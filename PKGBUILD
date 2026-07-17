@@ -1,6 +1,11 @@
 # Maintainer: pod32g
+#
+# NOTE: this file is the canonical copy. umaos/custom-pkgs/umao-dev-setup/ must
+# be kept byte-identical to it — the ISO build (scripts/build-iso.sh) uses that
+# copy, so any fix made only here silently never ships. CI enforces this; see
+# .github/workflows/ci.yml in the umaos repo.
 pkgname=umao-dev-setup
-pkgver=1.0.2
+pkgver=1.0.3
 pkgrel=1
 pkgdesc="UmaOS development environment setup wizard"
 arch=('any')
@@ -12,7 +17,11 @@ optdepends=('kdialog: fallback GUI when PyQt6 is unavailable'
             'qt6-tools: progress dialog updates (qdbus6) in the kdialog fallback'
             'yay: install AUR packages for the AI/editor stacks')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/pod32g/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+# Pinned, not SKIP: this is a fixed release tag fetched over the network, so an
+# unverified source lets a repo/CDN compromise or a moved tag land arbitrary
+# code in the ISO. Regenerate whenever pkgver changes:
+#   makepkg -g   (or: curl -sSL <url> | sha256sum)
+sha256sums=('59aa138dcd8e9d6ccad621adf2142e394e2b055038839b25eb8894a2df548cd9')
 
 package() {
     cd "$pkgname-$pkgver"
